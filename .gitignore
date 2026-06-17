@@ -1,0 +1,18 @@
+# Virtual Environments
+venv/
+.venv/
+app_build/venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+app_build/__pycache__/
+
+# Environment variables (Credentials)
+.env
+app_build/.env
+
+# Agent/IDE directories
+.agents/
