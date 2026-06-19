@@ -6,7 +6,9 @@ import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
+import aiohttp
 import discord
+from discord import Webhook
 from discord.ext import tasks
 import gitlab
 
@@ -18,12 +20,16 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 DISCORD_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
 GITLAB_PROJECT_ID = os.getenv("GITLAB_PROJECT_ID")
 GITLAB_GROUP_ID = os.getenv("GITLAB_GROUP_ID")
 GITLAB_URL = os.getenv("GITLAB_URL", "https://gitlab.com")
 SUMMARY_INTERVAL_HOURS = int(os.getenv("SUMMARY_INTERVAL_HOURS", "24"))
 STALE_THRESHOLD_DAYS = int(os.getenv("STALE_THRESHOLD_DAYS", "3"))
+SILENT_ERRORS = os.getenv("SILENT_ERRORS", "false").lower() in ("true", "yes", "1")
+SKIP_WEEKENDS = os.getenv("SKIP_WEEKENDS", "true").lower() in ("true", "yes", "1")
+
 
 # Mock Merge Request class for local verification/dry-run mode
 class MockMergeRequest:
@@ -100,15 +106,26 @@ def fetch_gitlab_data(gitlab_url, gitlab_token, project_id, stale_days, group_id
         mrs = get_mock_mrs()
     else:
         logger.info(f"Connecting to GitLab instance at {gitlab_url}...")
-        gl = gitlab.Gitlab(url=gitlab_url, private_token=gitlab_token)
-        if group_id:
-            logger.info(f"Fetching Merge Requests for GitLab group: {group_id}")
-            group = gl.groups.get(group_id)
-            mrs = group.mergerequests.list(state='opened', all=True)
-        else:
-            logger.info(f"Fetching Merge Requests for GitLab project: {project_id}")
-            project = gl.projects.get(project_id)
-            mrs = project.mergerequests.list(state='opened', all=True)
+        import time
+        max_retries = 3
+        retry_delay = 10
+        for attempt in range(1, max_retries + 1):
+            try:
+                gl = gitlab.Gitlab(url=gitlab_url, private_token=gitlab_token, timeout=20)
+                if group_id:
+                    logger.info(f"Fetching Merge Requests for GitLab group: {group_id} (Attempt {attempt}/{max_retries})")
+                    group = gl.groups.get(group_id)
+                    mrs = group.mergerequests.list(state='opened', all=True)
+                else:
+                    logger.info(f"Fetching Merge Requests for GitLab project: {project_id} (Attempt {attempt}/{max_retries})")
+                    project = gl.projects.get(project_id)
+                    mrs = project.mergerequests.list(state='opened', all=True)
+                break  # Success, exit retry loop
+            except Exception as e:
+                if attempt == max_retries:
+                    raise e
+                logger.warning(f"Attempt {attempt}/{max_retries} failed to connect to GitLab: {e}. Retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
 
     awaiting_review = []
     changes_requested = []
@@ -280,6 +297,18 @@ def format_summary_embeds(data, mapping):
     return embeds
 
 
+async def send_via_webhook(webhook_url, embeds):
+    """Sends embeds to a Discord webhook URL, chunking them up to 10 embeds per message."""
+    logger.info("Sending MR summary via Discord Webhook...")
+    async with aiohttp.ClientSession() as session:
+        webhook = Webhook.from_url(webhook_url, session=session)
+        # Webhook.send accepts up to 10 embeds per message.
+        for i in range(0, len(embeds), 10):
+            chunk = embeds[i:i+10]
+            await webhook.send(embeds=chunk)
+    logger.info("Summary posted successfully to Discord Webhook.")
+
+
 class MRBot(discord.Client):
     def __init__(self, mapping, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -314,21 +343,31 @@ class MRBot(discord.Client):
         await self.wait_until_ready()
 
     async def send_mr_summary(self):
-        if not self.channel_id:
-            logger.error("DISCORD_CHANNEL_ID is not configured. Cannot post summary.")
+        # Skip weekends (Saturday = 5, Sunday = 6)
+        if SKIP_WEEKENDS and datetime.now().weekday() in (5, 6):
+            logger.info("Today is weekend. Skipping MR summary posting as configured (SKIP_WEEKENDS=True).")
             return
-            
-        channel = self.get_channel(self.channel_id)
-        if not channel:
-            try:
-                channel = await self.fetch_channel(self.channel_id)
-            except Exception as e:
-                logger.error(f"Failed to fetch channel {self.channel_id}: {e}")
+
+        use_webhook = bool(DISCORD_WEBHOOK_URL)
+        channel = None
+
+
+        if not use_webhook:
+            if not self.channel_id:
+                logger.error("Neither DISCORD_WEBHOOK_URL nor DISCORD_CHANNEL_ID is configured. Cannot post summary.")
                 return
                 
-        if not channel:
-            logger.error(f"Channel with ID {self.channel_id} not found.")
-            return
+            channel = self.get_channel(self.channel_id)
+            if not channel:
+                try:
+                    channel = await self.fetch_channel(self.channel_id)
+                except Exception as e:
+                    logger.error(f"Failed to fetch channel {self.channel_id}: {e}")
+                    return
+                    
+            if not channel:
+                logger.error(f"Channel with ID {self.channel_id} not found.")
+                return
 
         try:
             # Execute GitLab API call in executor to avoid blocking the Discord bot client loop
@@ -343,19 +382,55 @@ class MRBot(discord.Client):
             )
         except Exception as e:
             logger.error(f"Failed to fetch GitLab data: {e}")
+            if SILENT_ERRORS:
+                logger.info("SILENT_ERRORS is enabled. Skipping error posting to Discord.")
+                return
+
             embed = discord.Embed(
-                title="❌ GitLab MR Fetch Error",
-                description=f"An error occurred while fetching merge requests from GitLab:\n`{e}`",
-                color=discord.Color.red(),
+                title="⚠️ O BOT DE MR APRESENTOU FALHAS, CONTATE O RESPONSÁVEL",
+                description=(
+                    "O bot não conseguiu obter a lista de Merge Requests pendentes no GitLab.\n\n"
+                    "**Possíveis causas:**\n"
+                    "• VPN da empresa desconectada\n"
+                    "• Servidor GitLab temporariamente indisponível\n"
+                    "• Problemas na conexão de internet da máquina\n\n"
+                    f"*Erro detalhado:* `{e}`"
+                ),
+                color=discord.Color.from_rgb(231, 76, 60),
                 timestamp=discord.utils.utcnow()
             )
-            await channel.send(embed=embed)
+            if use_webhook:
+                try:
+                    await send_via_webhook(DISCORD_WEBHOOK_URL, [embed])
+                except Exception as send_err:
+                    logger.error(f"Could not send error embed to webhook: {send_err}")
+            else:
+                try:
+                    await channel.send(embed=embed)
+                except discord.Forbidden:
+                    logger.error(f"Permission denied: Bot cannot send the error embed to channel {self.channel_id}. Please check the bot's permissions (View Channel, Send Messages) in that channel.")
+                except discord.HTTPException as he:
+                    logger.error(f"HTTP error sending error embed to channel {self.channel_id}: {he}")
             return
 
         embeds = format_summary_embeds(data, self.mapping)
-        for embed in embeds:
-            await channel.send(embed=embed)
-        logger.info("Summary posted successfully to Discord channel.")
+        if use_webhook:
+            try:
+                await send_via_webhook(DISCORD_WEBHOOK_URL, embeds)
+            except Exception as send_err:
+                logger.error(f"Could not send summary to webhook: {send_err}")
+        else:
+            for embed in embeds:
+                try:
+                    await channel.send(embed=embed)
+                except discord.Forbidden:
+                    logger.error(f"Permission denied: Bot cannot send the MR summary embed to channel {self.channel_id}. Please check the bot's permissions (View Channel, Send Messages) in that channel.")
+                    break
+                except discord.HTTPException as he:
+                    logger.error(f"HTTP error sending MR summary embed to channel {self.channel_id}: {he}")
+                    break
+            else:
+                logger.info("Summary posted successfully to Discord channel.")
 
 def run_dry_run(mapping):
     """Executes a dry-run local mock generation and outputs the formatted summary to console."""
@@ -406,6 +481,80 @@ def run_dry_run(mapping):
             
     print("="*50 + "\n")
 
+async def post_webhook_summary(mapping):
+    """Fetches GitLab data and sends it directly via Webhook without Discord Bot client."""
+    # Skip weekends (Saturday = 5, Sunday = 6)
+    if SKIP_WEEKENDS and datetime.now().weekday() in (5, 6):
+        logger.info("Today is weekend. Skipping MR summary posting as configured (SKIP_WEEKENDS=True).")
+        return
+
+    use_mock = not (GITLAB_TOKEN and (GITLAB_PROJECT_ID or GITLAB_GROUP_ID))
+    try:
+        data = await asyncio.to_thread(
+            fetch_gitlab_data,
+            GITLAB_URL,
+            GITLAB_TOKEN,
+            GITLAB_PROJECT_ID,
+            STALE_THRESHOLD_DAYS,
+            GITLAB_GROUP_ID,
+            use_mock
+        )
+    except Exception as e:
+        logger.error(f"Failed to fetch GitLab data: {e}")
+        if SILENT_ERRORS:
+            logger.info("SILENT_ERRORS is enabled. Skipping error posting to Discord.")
+            return
+
+        embed = discord.Embed(
+            title="⚠️ O BOT DE MR APRESENTOU FALHAS, CONTATE O RESPONSÁVEL",
+            description=(
+                "O bot não conseguiu obter a lista de Merge Requests pendentes no GitLab.\n\n"
+                "**Possíveis causas:**\n"
+                "• VPN da empresa desconectada\n"
+                "• Servidor GitLab temporariamente indisponível\n"
+                "• Problemas na conexão de internet da máquina\n\n"
+                f"*Erro detalhado:* `{e}`"
+            ),
+            color=discord.Color.from_rgb(231, 76, 60),
+            timestamp=discord.utils.utcnow()
+        )
+        try:
+            await send_via_webhook(DISCORD_WEBHOOK_URL, [embed])
+        except Exception as send_err:
+            logger.error(f"Could not send error embed to webhook: {send_err}")
+        return
+
+    embeds = format_summary_embeds(data, mapping)
+    try:
+        await send_via_webhook(DISCORD_WEBHOOK_URL, embeds)
+    except Exception as send_err:
+        logger.error(f"Could not send summary to webhook: {send_err}")
+
+
+async def run_webhook_loop(mapping):
+    logger.info("Starting Webhook-Only Mode loop...")
+    
+    # 1. Post initial summary on startup
+    logger.info("Executing initial summary post on startup (Webhook Mode)...")
+    await post_webhook_summary(mapping)
+    
+    # 2. Continuous loop
+    interval_seconds = SUMMARY_INTERVAL_HOURS * 3600
+    logger.info(f"Webhook loop scheduled to run every {SUMMARY_INTERVAL_HOURS} hours.")
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            logger.info("Executing scheduled summary post (Webhook Mode)...")
+            await post_webhook_summary(mapping)
+        except asyncio.CancelledError:
+            logger.info("Webhook loop cancelled.")
+            break
+        except Exception as e:
+            logger.error(f"Exception in webhook loop: {e}")
+            # Wait a short amount of time before retrying if there was an exception, to avoid spinning
+            await asyncio.sleep(60)
+
+
 def main():
     # Load mapping configuration
     mapping = {}
@@ -423,14 +572,23 @@ def main():
         run_dry_run(mapping)
         return
 
+    # Check for Webhook-only Mode (No Discord token, but webhook URL is configured)
+    if not DISCORD_TOKEN and DISCORD_WEBHOOK_URL:
+        logger.info("DISCORD_TOKEN not set, but DISCORD_WEBHOOK_URL is configured. Starting in Webhook-only Mode.")
+        try:
+            asyncio.run(run_webhook_loop(mapping))
+        except KeyboardInterrupt:
+            logger.info("Webhook-Only Mode stopped by user.")
+        return
+
     # Check for required configuration to run live
     if not DISCORD_TOKEN:
         logger.error("DISCORD_TOKEN environment variable not set. Running in dry-run mode automatically.")
         run_dry_run(mapping)
         return
 
-    if not DISCORD_CHANNEL_ID:
-        logger.error("DISCORD_CHANNEL_ID environment variable not set. Cannot run bot.")
+    if not DISCORD_CHANNEL_ID and not DISCORD_WEBHOOK_URL:
+        logger.error("Neither DISCORD_CHANNEL_ID nor DISCORD_WEBHOOK_URL is configured. Cannot run bot.")
         sys.exit(1)
 
     # Initialize intents and client
